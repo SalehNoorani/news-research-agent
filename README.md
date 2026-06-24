@@ -1,8 +1,19 @@
-# News Research Agent
----
-## Full Guide
+# pgvector News Research Agent
 
-A complete RAG (Retrieval-Augmented Generation) pipeline that embeds your crypto news posts into a vector database and exposes a semantic search chatbot API. Built on a self-hosted VPS alongside an existing n8n setup.
+A self-hosted RAG (Retrieval-Augmented Generation) pipeline that embeds crypto news posts into a vector database, exposes a semantic search chatbot API, and publishes weekly AI-generated analysis articles to an Astro website.
+
+Built on a VPS alongside an existing n8n setup.
+
+---
+
+## What it does
+
+- Pulls markdown blog posts from a private GitHub repo every 6 hours
+- Embeds them using `text-embedding-3-small` via OpenRouter
+- Stores embeddings + sentiment + metadata in a self-hosted pgvector database
+- Exposes a FastAPI endpoint (`/ask`) that answers questions grounded in your posts
+- Publishes a weekly analysis article every Thursday to `src/content/analysis/`
+- Powers a `/search` chatbot page on the Astro frontend
 
 ---
 
@@ -10,39 +21,59 @@ A complete RAG (Retrieval-Augmented Generation) pipeline that embeds your crypto
 
 ```
 GitHub Repo (markdown posts)
-        ↓ (PyGithub, daily cron)
-   ingest.py
-        ↓ (OpenAI text-embedding-3-small via OpenRouter)
-   pgvector (PostgreSQL + vector extension, Docker)
-        ↓ (FastAPI, uvicorn, systemd)
-   api.py → POST /ask
-        ↓ (Caddy reverse proxy)
-   https://your-address.com/ask
+GitHub Repo (markdown posts)
+        ↓ every 6 hours (ingest.py)
+   text-embedding-3-small (OpenRouter)
         ↓
-   Astro frontend (/search page)
+   pgvector (PostgreSQL + vector extension, Docker)
+        ↓ on query (api.py)
+   DeepSeek v4 Flash (OpenRouter)
+        ↓
+   FastAPI → https://your-website-api.com/ask
+        ↓
+   Astro /search page (chatbot)
+
+   analyst.py (every Thursday 10am)
+        ↓
+   src/content/analysis/ (GitHub)
+        ↓
+   Astro blog page (weekly analysis carousel)
 ```
+
+---
+
+## Stack
+
+| Component | Technology |
+|---|---|
+| Vector DB | pgvector (PostgreSQL 16, Docker) |
+| Embeddings | `openai/text-embedding-3-small` via OpenRouter |
+| Analysis & Chat | `deepseek/deepseek-v4-flash` via OpenRouter |
+| API | FastAPI + Uvicorn (systemd service) |
+| Reverse proxy | Caddy (Docker) |
+| Runtime | Python 3.12, venv |
+| Frontend | Astro, Cloudflare Pages |
 
 ---
 
 ## Prerequisites
 
 - Ubuntu/Debian VPS
-- Docker installed
-- An existing Docker network called `app-network`
-- Caddy reverse proxy running in Docker on `app-network`
-- Python 3.12+
+- Docker + an existing Docker network named `app-network`
+- Caddy running in Docker on `app-network`
+- Python 3.12
 - OpenRouter account + API key
-- GitHub Personal Access Token (fine-grained, read-only Contents access)
-- Cloudflare managing your domain's DNS
+- GitHub Personal Access Token — read-only (for ingestion) and write access (for publishing analysis)
+- Cloudflare managing your domain DNS
 
-## Cost summary
+## Cost estimate
 
-| Service | Cost |
+| Item | Cost |
 |---|---|
-| OpenRouter embeddings | ~$0.09/year |
-| OpenRouter chat (DeepSeek) | Negligible at this scale |
+| Embeddings (`text-embedding-3-small`) | ~$0.09/year |
+| DeepSeek v4 Flash (analysis + chat) | <$1/month at this scale |
 | pgvector (self-hosted) | Free |
-| VPS | Existing |
+| Caddy, FastAPI, systemd | Free |
 
 ---
 
@@ -50,14 +81,16 @@ GitHub Repo (markdown posts)
 
 ```
 ~/services/pgvector/
-├── docker-compose.yml
-├── .env
-├── ingest.py
-├── search.py
-├── analyst.py
-├── api.py
+├── docker-compose.yml   # pgvector container
+├── .env                 # all secrets
+├── ingest.py            # GitHub → embed → store
+├── search.py            # CLI semantic search tester
+├── analyst.py           # weekly analysis generator + GitHub publisher
+├── leaderboard.py       # entity leaderboard (disabled, kept for reference)
+├── api.py               # FastAPI chatbot endpoint
 ├── ingest.log
-└── analyst.log
+├── analyst.log
+└── venv/
 ```
 
 ---
@@ -125,6 +158,8 @@ CREATE TABLE posts (
     category TEXT,
     published_at TIMESTAMPTZ,
     embedding vector(1536),
+    sentiment TEXT,
+    entities TEXT[],
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -160,14 +195,20 @@ nano ~/services/pgvector/.env
 
 ```env
 OPENAI_API_KEY=your_openrouter_key
-GITHUB_TOKEN=your_github_pat
-GITHUB_REPO=YourUsername/yourrepo
+GITHUB_TOKEN=your_github_read_pat
+GITHUB_WRITE_TOKEN=your_github_write_pat
 DB_HOST=localhost
 DB_PORT=5433
 DB_NAME=newsresearch
 DB_USER=pgvector
 DB_PASSWORD=yourpassword
 ```
+
+**GitHub tokens:**
+- `GITHUB_TOKEN` — fine-grained PAT, read-only Contents access
+- `GITHUB_WRITE_TOKEN` — classic PAT with `repo` scope (needed to push analysis files to private repo)
+
+> Never paste tokens in chat or commit `.env` to GitHub.
 
 ---
 
@@ -327,3 +368,23 @@ const data = await response.json();
 ```
 
 ---
+
+## Troubleshooting
+
+**Caddy can't reach the API (`connection refused`):**
+Make sure `host.docker.internal:host-gateway` is in your Caddy docker-compose and you're using `host.docker.internal:8000` in the Caddyfile, not `localhost`.
+
+**ivfflat index warning on empty table:**
+Harmless. Resolves automatically once posts are ingested.
+
+**`externally-managed-environment` pip error:**
+You ran pip outside the venv. Run `source venv/bin/activate` first.
+
+**PyGithub deprecation warning:**
+Use `Github(auth=Auth.Token(...))` instead of `Github(token)`.
+
+**API returns empty answer:**
+DeepSeek occasionally returns null responses. The `analyze_post` function handles this gracefully with a try/except fallback.
+
+**DNS not resolving after adding Cloudflare record:**
+Wait 1-2 minutes for propagation, then test again.
